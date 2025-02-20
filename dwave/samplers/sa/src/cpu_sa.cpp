@@ -18,6 +18,7 @@
 #include <math.h>
 #include <vector>
 #include <stdexcept>
+#include <cassert>
 #include "cpu_sa.h"
 
 
@@ -43,11 +44,11 @@ thread_local uint64_t rng_state[2];
 // @param state the current state of all variables
 // @param h vector of h or field value on each variable
 // @param degrees the degree of each variable
-// @param neighbors lists of the neighbors of each variable, such that 
+// @param neighbors lists of the neighbors of each variable, such that
 //     neighbors[i][j] is the jth neighbor of variable i.
 // @param neighbour_couplings same as neighbors, but instead has the J value.
 //     neighbour_couplings[i][j] is the J value or weight on the coupling
-//     between variables i and neighbors[i][j]. 
+//     between variables i and neighbors[i][j].
 // @return delta energy
 double get_flip_energy(
     int var,
@@ -71,17 +72,39 @@ double get_flip_energy(
     return -2 * state[var] * energy;
 }
 
+double log_sum_exp(double x[], int endpoint)
+{
+   if(endpoint > 0 ){
+      double max_val = x[0];
+      double sum = 0;
+
+      for (int i = 1 ; i < endpoint ; i++){
+         if (x[i] > max_val){
+            max_val = x[i];
+         }
+      }
+      for (int i = 0; i < endpoint ; i++){
+         sum += exp(x[i] - max_val);
+      }
+      return log(sum) + max_val;
+   }
+   else
+   {
+      return 0.0;
+   }
+}
+
 // Performs a single run of simulated annealing with the given inputs.
 // @param state a int8 array where each int8 holds the state of a
 //        variable. Note that this will be used as the initial state of the
 //        run.
 // @param h vector of h or field value on each variable
 // @param degrees the degree of each variable
-// @param neighbors lists of the neighbors of each variable, such that 
+// @param neighbors lists of the neighbors of each variable, such that
 //        neighbors[i][j] is the jth neighbor of variable i. Note
 // @param neighbour_couplings same as neighbors, but instead has the J value.
 //        neighbour_couplings[i][j] is the J value or weight on the coupling
-//        between variables i and neighbors[i][j]. 
+//        between variables i and neighbors[i][j].
 // @param sweeps_per_beta The number of sweeps to perform at each beta value.
 //        Total number of sweeps is `sweeps_per_beta` * length of
 //        `beta_schedule`.
@@ -96,7 +119,9 @@ void simulated_annealing_run(
     const vector<vector<int>>& neighbors,
     const vector<vector<double>>& neighbour_couplings,
     const int sweeps_per_beta,
-    const vector<double>& beta_schedule
+    const vector<double>& beta_schedule,
+    double* logz_ptr,
+    const double init_energy
 ) {
     const int num_vars = h.size();
 
@@ -115,9 +140,14 @@ void simulated_annealing_run(
 
     bool flip_spin;
     // perform the sweeps
-    for (int beta_idx = 0; beta_idx < (int)beta_schedule.size(); beta_idx++) {
+    logz_ptr[0] = num_vars*log(2);
+    double energy = init_energy;
+    for (int beta_idx = 0; beta_idx < (int) beta_schedule.size(); beta_idx++) {
         // get the beta value for this sweep
         const double beta = beta_schedule[beta_idx];
+        if (beta_idx > 0){
+            logz_ptr[0] += (beta_schedule[beta_idx - 1]-beta)*energy;
+        }
         for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
 
             // this threshold will allow us to skip the metropolis update for
@@ -164,33 +194,33 @@ void simulated_annealing_run(
                 }
 
                 if (flip_spin) {
-                    // since we have accepted the spin flip of variable `var`, 
-                    // we need to adjust the delta energies of all the 
+                    // since we have accepted the spin flip of variable `var`,
+                    // we need to adjust the delta energies of all the
                     // neighboring variables
                     const std::int8_t multiplier = 4 * state[var];
                     // iterate over the neighbors of `var`
                     for (int n_i = 0; n_i < degrees[var]; n_i++) {
                         int neighbor = neighbors[var][n_i];
-                        // adjust the delta energy by 
+                        // adjust the delta energy by
                         // 4 * `var` state * coupler weight * neighbor state
-                        // the 4 is because the original contribution from 
+                        // the 4 is because the original contribution from
                         // `var` to the neighbor's delta energy was
                         // 2 * `var` state * coupler weight * neighbor state,
-                        // so since we are flipping `var`'s state, we need to 
+                        // so since we are flipping `var`'s state, we need to
                         // multiply it again by 2 to get the full offset.
-                        delta_energy[neighbor] += multiplier * 
+                        delta_energy[neighbor] += multiplier *
                             neighbour_couplings[var][n_i] * state[neighbor];
                     }
 
-                    // now we just need to flip its state and negate its delta 
+                    // now we just need to flip its state and negate its delta
                     // energy
+                    energy += delta_energy[var];
                     state[var] *= -1;
                     delta_energy[var] *= -1;
                 }
             }
         }
     }
-
     free(delta_energy);
 }
 
@@ -199,9 +229,9 @@ void simulated_annealing_run(
 // @param h vector of h or field value on each variable
 // @param coupler_starts an int vector containing the variables of one side of
 //        each coupler in the problem
-// @param coupler_ends an int vector containing the variables of the other side 
+// @param coupler_ends an int vector containing the variables of the other side
 //        of each coupler in the problem
-// @param coupler_weights a double vector containing the weights of the 
+// @param coupler_weights a double vector containing the weights of the
 //        couplers in the same order as coupler_starts and coupler_ends
 // @return A double corresponding to the energy for `state` on the problem
 //        defined by h and the couplers passed in
@@ -235,7 +265,7 @@ double get_state_energy(
 // @param h vector of h or field value on each variable
 // @param coupler_starts an int vector containing the variables of one side of
 //        each coupler in the problem
-// @param coupler_ends an int vector containing the variables of the other side 
+// @param coupler_ends an int vector containing the variables of the other side
 //        of each coupler in the problem
 // @param coupler_weights a double vector containing the weights of the couplers
 //        in the same order as coupler_starts and coupler_ends
@@ -262,20 +292,21 @@ int general_simulated_annealing(
     const VariableOrder varorder,
     const Proposal proposal_acceptance_criteria,
     callback interrupt_callback,
-    void * const interrupt_function
+    void * const interrupt_function,
+    double* logzs_ptr
 ) {
-    // TODO 
+    // TODO
     // assert len(states) == num_samples*num_vars*sizeof(int8_t)
     // assert len(coupler_starts) == len(coupler_ends) == len(coupler_weights)
     // assert max(coupler_starts + coupler_ends) < num_vars
-    
+
     // the number of variables in the problem
     const int num_vars = h.size();
     if (!((coupler_starts.size() == coupler_ends.size()) &&
                 (coupler_starts.size() == coupler_weights.size()))) {
         throw runtime_error("coupler vectors have mismatched lengths");
     }
-    
+
     // set the seed of the RNG
     // note that xorshift+ requires a non-zero seed
     rng_state[0] = seed ? seed : RANDMAX;
@@ -324,29 +355,35 @@ int general_simulated_annealing(
         // then do the actual sample. this function will modify state, storing
         // the sample there
 	// Branching here is designed to make expicit compile time optimizations
+        energies[sample] = get_state_energy(state, h, coupler_starts,
+                                            coupler_ends, coupler_weights);
         if (varorder == Random) {
             if (proposal_acceptance_criteria == Metropolis) {
                 simulated_annealing_run<Random, Metropolis>(state, h, degrees,
                                                     neighbors, neighbour_couplings,
-                                                    sweeps_per_beta, beta_schedule);
+                                                    sweeps_per_beta, beta_schedule,
+                                                    logzs_ptr+sample, energies[sample]);
             } else {
                 simulated_annealing_run<Random, Gibbs>(state, h, degrees,
                                                      neighbors, neighbour_couplings,
-                                                     sweeps_per_beta, beta_schedule);
+                                                     sweeps_per_beta, beta_schedule,
+                                                     logzs_ptr+sample, energies[sample]);
           }
         } else {
             if (proposal_acceptance_criteria == Metropolis) {
                 simulated_annealing_run<Sequential, Metropolis>(state, h, degrees,
                                                      neighbors, neighbour_couplings,
-                                                     sweeps_per_beta, beta_schedule);
+                                                     sweeps_per_beta, beta_schedule,
+                                                     logzs_ptr+sample, energies[sample]);
             } else {
                 simulated_annealing_run<Sequential, Gibbs>(state, h, degrees,
                                                       neighbors, neighbour_couplings,
-                                                      sweeps_per_beta, beta_schedule);
+                                                      sweeps_per_beta, beta_schedule,
+                                                      logzs_ptr+sample, energies[sample]);
             }
         }
         // compute the energy of the sample and store it in `energies`
-        energies[sample] = get_state_energy(state, h, coupler_starts, 
+        energies[sample] = get_state_energy(state, h, coupler_starts,
                                             coupler_ends, coupler_weights);
 
         sample++;
@@ -355,6 +392,8 @@ int general_simulated_annealing(
         if (interrupt_function && interrupt_callback(interrupt_function)) break;
     }
 
+    double logz = log_sum_exp(logzs_ptr, num_samples)-log(num_samples);
+    printf("logz %f", logz);
     // return the number of samples we actually took
     return sample;
 }
